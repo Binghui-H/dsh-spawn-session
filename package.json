@@ -1,6 +1,6 @@
 {
   "name": "dsh-spawn-session",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "description": "Spawn a Session into a chosen Workspace, and message live Sessions with wake-on-finish hand-off, from tool calls.",
   "main": "index.js",

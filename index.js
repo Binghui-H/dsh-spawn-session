@@ -190,6 +190,20 @@ function inheritSelection(ctx, callerAgent) {
 }
 
 /**
+ * Append the caller's Session id to a spawned prompt, so the child knows where
+ * to report without the user retyping an id every time.
+ * @param prompt - the caller's original prompt.
+ * @param callerSessionId - identity of the Session that called spawn_session.
+ * @returns the prompt, unchanged when the caller identity is unknown.
+ */
+function withReportAddress(prompt, callerSessionId) {
+  if (typeof callerSessionId !== 'string' || callerSessionId === '') return prompt
+  return `${prompt}\n\n---\n`
+    + `（来自 spawn_session：你的汇报对象是会话 ${callerSessionId}。需要回报时，用 ask_session 工具把消息发给它，`
+    + 'wait 参数传 false。不要向其它会话发消息。）'
+}
+
+/**
  * Register the orchestration tools.
  * @param {import('@deepseek-ai/cordis').Context} ctx - calling context.
  * @param {Record<string, unknown>} [config] - optional plugin settings.
@@ -319,7 +333,7 @@ export function apply(ctx, config) {
             : args.prompt.trim().slice(0, 40),
         )
 
-        handle.agent.followup(userMessage(args.prompt))
+        handle.agent.followup(userMessage(withReportAddress(args.prompt, exec?.agent?.session?.id)))
 
         return {
           sessionId,
