@@ -93,14 +93,18 @@ dsh plugin --profile desktop add github:Binghui-H/dsh-spawn-session
 spawn_session(
   workspacePath: string,   // 目标工作区的绝对路径
   prompt: string,          // 发给新会话的第一条消息
-  title?: string           // 可选标题，默认取 prompt 前 40 字
+  title?: string,          // 可选标题，默认取 prompt 前 40 字
+  provider?: string,       // 可选：模型提供方，必须与 model 同时给出
+  model?: string           // 可选：模型 id
 )
 ```
+
+**模型默认继承调用方**，而不是回落到 Profile 默认。原因很实际：Profile 默认模型可能额度耗尽或不可用，而调用方此刻能跑就说明它的模型可用——让子会话继承它，才不会出现「我自己能说话、派出去的子会话一开口就 429」。
 
 返回：
 
 ```
-Spawned session-xxxx in D:\path\to\workspace (permission: spawn-write).
+Spawned session-xxxx in D:\path\to\workspace (permission: spawn-write, model: deepseek-account/deepseek-flash).
 ```
 
 对 Agent 说人话即可，例如：
@@ -129,8 +133,10 @@ ask_session(
 返回：
 
 ```
-{ sessionId: "session-xxxx", status: "answered" | "queued" | "timeout", reply?: "..." }
+{ sessionId: "session-xxxx", status: "answered" | "queued" | "timeout" | "error", reply?: "...", error?: "..." }
 ```
+
+`status: "error"` 表示目标这一轮**失败结束**（例如 `RATE_LIMIT` / 额度耗尽），此时 `error` 带错误码与原因。失败不会被当成「它回了空话」。
 
 唤醒消息长这样（前缀固定，便于和真人消息区分）：
 

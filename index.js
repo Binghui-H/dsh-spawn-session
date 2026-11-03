@@ -157,14 +157,36 @@ function resolvePermission(ctx, settings) {
 }
 
 /** Describe one finished target for the waking message. */
-function buildNotice({ sessionId, title, reply, note }) {
-  const heading = title === undefined
-    ? `${NOTICE_PREFIX} 会话 ${sessionId} 已完成。`
-    : `${NOTICE_PREFIX} 会话 ${sessionId}（${title}）已完成。`
+function buildNotice({ sessionId, title, reply, note, failure }) {
+  const heading = failure === undefined
+    ? (title === undefined
+        ? `${NOTICE_PREFIX} 会话 ${sessionId} 已完成。`
+        : `${NOTICE_PREFIX} 会话 ${sessionId}（${title}）已完成。`)
+    : (title === undefined
+        ? `${NOTICE_PREFIX} 会话 ${sessionId} 这一轮失败了。`
+        : `${NOTICE_PREFIX} 会话 ${sessionId}（${title}）这一轮失败了。`)
   const parts = [heading]
   if (note !== undefined) parts.push(`你的备注：${note}`)
+  if (failure !== undefined) parts.push(`失败原因：${failure}`)
   parts.push(reply === '' ? '它的最后回复：(没有文本输出)' : `它的最后回复：\n${reply}`)
   return parts.join('\n')
+}
+
+/**
+ * Model selection a spawned Session should start with: the caller's own, read
+ * from its last request header. A child that inherits a working model can think;
+ * one that falls back to an exhausted Profile default cannot.
+ * @param ctx - calling context.
+ * @param callerAgent - the Agent whose tool call is in flight, if any.
+ * @returns provider and model to create the child with.
+ */
+function inheritSelection(ctx, callerAgent) {
+  const config = callerAgent?.session?.requestHeader?.()?.config
+  if (config !== undefined && typeof config.provider === 'string' && typeof config.model === 'string') {
+    return { provider: config.provider, model: config.model }
+  }
+  const fallback = ctx.agentDefaultModel.currentSelection()
+  return { provider: fallback.provider, model: fallback.model }
 }
 
 /**
@@ -221,30 +243,46 @@ export function apply(ctx, config) {
           type: 'string',
           description: 'Optional Session title; defaults to the head of the prompt.',
         },
+        provider: {
+          type: 'string',
+          description: 'Optional provider route for the new Session; requires model. Defaults to the calling Session\'s provider.',
+        },
+        model: {
+          type: 'string',
+          description: 'Optional model id for the new Session; requires provider. Defaults to the calling Session\'s model.',
+        },
       },
     },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
-        required: ['sessionId', 'workspacePath', 'permissionPreset'],
+        required: ['sessionId', 'workspacePath', 'permissionPreset', 'provider', 'model'],
         properties: {
           sessionId: { type: 'string' },
           workspacePath: { type: 'string' },
           permissionPreset: { type: 'string' },
+          provider: { type: 'string' },
+          model: { type: 'string' },
         },
       },
       render: (_args, value) => [{
         type: 'text',
-        text: `Spawned ${value.sessionId} in ${value.workspacePath} (permission: ${value.permissionPreset}).`,
+        text: `Spawned ${value.sessionId} in ${value.workspacePath} `
+          + `(permission: ${value.permissionPreset}, model: ${value.provider}/${value.model}).`,
       }],
     },
-    async execute(args) {
+    async execute(args, exec) {
       if (typeof args.workspacePath !== 'string' || !isAbsolute(args.workspacePath)) {
         throw new TypeError(`spawn_session workspacePath must be an absolute path, got ${JSON.stringify(args.workspacePath)}`)
       }
       if (typeof args.prompt !== 'string' || args.prompt.trim() === '') {
         throw new TypeError('spawn_session prompt must be a non-empty string')
+      }
+      const hasProvider = typeof args.provider === 'string' && args.provider.trim() !== ''
+      const hasModel = typeof args.model === 'string' && args.model.trim() !== ''
+      if (hasProvider !== hasModel) {
+        throw new TypeError('spawn_session provider and model must be given together')
       }
 
       // Resolve everything before creating, so a misconfigured Profile fails here
@@ -255,7 +293,12 @@ export function apply(ctx, config) {
 
       try {
         const workspace = await ctx.workspaceRegistry.create(args.workspacePath)
-        const selection = ctx.agentDefaultModel.currentSelection()
+        // Inherit the CALLING Session's model by default. The Profile default can
+        // be exhausted or unable to serve, and a child that cannot think is worse
+        // than no child at all; the caller is by definition able to run right now.
+        const selection = hasProvider
+          ? { provider: args.provider, model: args.model }
+          : inheritSelection(ctx, exec?.agent)
         const sessionId = `session-${randomUUID()}`
 
         const handle = await ctx.agents.create({
@@ -282,6 +325,8 @@ export function apply(ctx, config) {
           sessionId,
           workspacePath: workspace.path,
           permissionPreset: permission.name,
+          provider: selection.provider,
+          model: selection.model,
         }
       } finally {
         await releaseScope(scope)
@@ -330,18 +375,21 @@ export function apply(ctx, config) {
           sessionId: { type: 'string' },
           status: {
             type: 'string',
-            enum: ['answered', 'queued', 'timeout'],
+            enum: ['answered', 'queued', 'timeout', 'error'],
           },
           reply: { type: 'string' },
+          error: { type: 'string' },
         },
       },
       render: (_args, value) => [{
         type: 'text',
         text: value.status === 'answered'
           ? `Session ${value.sessionId} answered:\n${value.reply ?? ''}`
-          : value.status === 'queued'
-            ? `Queued for ${value.sessionId}; the caller is woken when that turn ends.`
-            : `Session ${value.sessionId} is still running after the wait budget; the caller is woken when that turn ends.`,
+          : value.status === 'error'
+            ? `Session ${value.sessionId} FAILED this turn: ${value.error ?? 'unknown error'}`
+            : value.status === 'queued'
+              ? `Queued for ${value.sessionId}; the caller is woken when that turn ends.`
+              : `Session ${value.sessionId} is still running after the wait budget; the caller is woken when that turn ends.`,
       }],
     },
     async execute(args, exec) {
@@ -375,6 +423,8 @@ export function apply(ctx, config) {
       // Only a `turn/end` past this mark belongs to the turn this call starts.
       const baseline = target.session.seq
       let latest = ''
+      /** Message of the failure that ended the target turn, when it failed. */
+      let failure
       let settled = false
       /** Whether the tool call already returned a result to the caller. */
       let reported = false
@@ -397,6 +447,13 @@ export function apply(ctx, config) {
           resolveAnswer({ sessionId: target.session.id, status: 'answered', reply: latest })
           return
         }
+        // A failed turn is reported as a failure, never as an empty answer: the
+        // caller must not mistake "it crashed" for "it said nothing".
+        if (reason === 'error' && !reported) {
+          reported = true
+          resolveAnswer({ sessionId: target.session.id, status: 'error', error: failure ?? 'unknown error' })
+          return
+        }
         // Either the call already returned (queued, or the wait budget elapsed),
         // or the watch itself expired: deliver what we have as a new turn so the
         // caller is still woken instead of losing the answer.
@@ -404,12 +461,17 @@ export function apply(ctx, config) {
           sessionId: target.session.id,
           title: undefined,
           reply: latest,
+          failure: reason === 'error' ? (failure ?? 'unknown error') : undefined,
           note: typeof args.note === 'string' && args.note.trim() !== '' ? args.note : undefined,
         }))
         injected.add(notice.id)
         caller.followup(notice)
         reported = true
-        resolveAnswer({ sessionId: target.session.id, status: reason === 'answered' ? 'answered' : 'timeout' })
+        resolveAnswer({
+          sessionId: target.session.id,
+          status: reason === 'error' ? 'error' : reason === 'answered' ? 'answered' : 'timeout',
+          ...(reason === 'error' ? { error: failure ?? 'unknown error' } : {}),
+        })
       }
 
       const off = ctx.on('session/event', (session, event) => {
@@ -420,7 +482,18 @@ export function apply(ctx, config) {
           if (text !== '') latest = text
           return
         }
-        if (event.type === 'turn/end') settle('answered')
+        if (event.type === 'turn/end') {
+          const reason = event.data?.reason
+          if (reason?.kind === 'error') {
+            const error = reason.error
+            failure = typeof error?.message === 'string'
+              ? (typeof error.code === 'string' ? `${error.code}: ${error.message}` : error.message)
+              : 'unknown error'
+            settle('error')
+            return
+          }
+          settle('answered')
+        }
       })
 
       const ttlTimer = setTimeout(() => {
