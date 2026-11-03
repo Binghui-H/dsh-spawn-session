@@ -394,7 +394,7 @@ export function apply(ctx, config) {
         hops.set(callerId, depth)
         if (reason === 'answered' && !reported) {
           reported = true
-          resolveAnswer({ status: 'answered', reply: latest })
+          resolveAnswer({ sessionId: target.session.id, status: 'answered', reply: latest })
           return
         }
         // Either the call already returned (queued, or the wait budget elapsed),
@@ -409,7 +409,7 @@ export function apply(ctx, config) {
         injected.add(notice.id)
         caller.followup(notice)
         reported = true
-        resolveAnswer({ status: reason === 'answered' ? 'answered' : 'timeout' })
+        resolveAnswer({ sessionId: target.session.id, status: reason === 'answered' ? 'answered' : 'timeout' })
       }
 
       const off = ctx.on('session/event', (session, event) => {
@@ -435,7 +435,7 @@ export function apply(ctx, config) {
         // The wait budget is a reporting limit, not a cancellation: keep
         // listening so the caller is still woken when the turn really ends.
         reported = true
-        resolveAnswer({ status: 'timeout' })
+        resolveAnswer({ sessionId: target.session.id, status: 'timeout' })
       }, settings.answerTimeoutMs)
       answerTimer.unref?.()
 
@@ -443,7 +443,7 @@ export function apply(ctx, config) {
 
       if (args.wait !== true) {
         reported = true
-        resolveAnswer({ status: 'queued' })
+        resolveAnswer({ sessionId: target.session.id, status: 'queued' })
       }
       return answered
     },
