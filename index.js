@@ -1,16 +1,26 @@
 /**
- * Cordis plugin: spawn a Session into a chosen Workspace and prompt it.
+ * Cordis plugin: orchestrate Sessions from inside a Session.
  *
- * Creating the Session inside the Host process is what makes it appear at once:
- * `session/created` emits `api-session/added`, every connected window upserts the
- * row, and `workspace.attachSession` publishes the group membership increment.
- * Nothing has to be refreshed, restarted, or clicked.
+ * Two tools:
+ *
+ * - `spawn_session` creates a NEW Session inside a chosen Workspace and prompts
+ *   it. Creating it inside the Host process is what makes the row appear at
+ *   once: `session/created` emits `api-session/added`, every connected window
+ *   upserts the row, and `workspace.attachSession` publishes the group
+ *   membership increment. Nothing is refreshed, restarted, or clicked.
+ *
+ * - `ask_session` messages a Session that is already live in this Host, and can
+ *   either wait for its answer or hand the answer back to the calling Session as
+ *   a fresh turn. The wake is the Host's own inbox mechanism: `agent.followup()`
+ *   splices into `next-turn` with `wakeup: true`, so an idle Agent starts a new
+ *   turn when that message lands.
  *
  * The module deliberately imports nothing from `@deepseek-ai/*`. A linked
  * Profile plugin resolves bare specifiers through the Profile's shared
- * directory, which may hold a different release line than the running Host; both
- * values it would have imported (`createUserMessage`, `defineTool`) are trivial
- * and are built here instead, so the plugin cannot bind to the wrong version.
+ * directory, which may hold a different release line than the running Host; the
+ * three values it would have imported (`createUserMessage`, `defineTool`,
+ * `SessionSeq`) are trivial and are built here instead, so the plugin cannot
+ * bind to the wrong version.
  *
  * @module dsh-spawn-session
  */
@@ -21,7 +31,7 @@ import { isAbsolute } from 'node:path'
 /** Cordis plugin name. */
 export const name = 'spawn-session'
 
-/** Every capability the spawn transaction touches. */
+/** Every capability the orchestration transaction touches. */
 export const inject = [
   'tools',
   'agents',
@@ -43,15 +53,34 @@ const DEFAULTS = {
    * Profile. Set it to `null` to fail instead of degrading.
    */
   fallbackPermissionPreset: 'workspace-write',
+  /** How many hand-offs a chain of `ask_session` calls may span. */
+  maxHops: 3,
+  /** How long `ask_session(wait: true)` blocks before reporting a timeout. */
+  answerTimeoutMs: 120_000,
+  /** How long a pending hand-off listens for the target turn before giving up. */
+  watchTtlMs: 1_800_000,
 }
 
-/** Read one optional setting, falling back to its default. */
-function readSetting(config, key) {
+/** Prefix every injected wake message carries, so a human can tell it apart. */
+const NOTICE_PREFIX = '[dsh-spawn-session]'
+
+/** Read one optional string setting, falling back to its default. */
+function readString(config, key) {
   const value = config?.[key]
   if (value === undefined) return DEFAULTS[key]
   if (value === null) return null
   if (typeof value !== 'string' || value.trim() === '') {
     throw new TypeError(`spawn-session: ${key} must be a non-empty string or null`)
+  }
+  return value
+}
+
+/** Read one optional positive integer setting, falling back to its default. */
+function readInteger(config, key) {
+  const value = config?.[key]
+  if (value === undefined) return DEFAULTS[key]
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError(`spawn-session: ${key} must be a positive integer`)
   }
   return value
 }
@@ -66,7 +95,7 @@ function deepFreeze(value) {
 /**
  * Build the user message the Host's `createUserMessage` would build:
  * `deepFreeze(structuredClone({ ...input, role: 'user', id }))`.
- * @param {string} text - prompt text.
+ * @param {string} text - message text.
  * @returns frozen user message.
  */
 function userMessage(text) {
@@ -76,6 +105,16 @@ function userMessage(text) {
     source: { kind: 'user' },
     id: randomUUID(),
   }))
+}
+
+/** Collect the text blocks of one assistant message. */
+function textOf(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('')
 }
 
 /** Release one preset scope across engines that expose either disposal symbol. */
@@ -117,17 +156,46 @@ function resolvePermission(ctx, settings) {
   }
 }
 
+/** Describe one finished target for the waking message. */
+function buildNotice({ sessionId, title, reply, note }) {
+  const heading = title === undefined
+    ? `${NOTICE_PREFIX} 会话 ${sessionId} 已完成。`
+    : `${NOTICE_PREFIX} 会话 ${sessionId}（${title}）已完成。`
+  const parts = [heading]
+  if (note !== undefined) parts.push(`你的备注：${note}`)
+  parts.push(reply === '' ? '它的最后回复：(没有文本输出)' : `它的最后回复：\n${reply}`)
+  return parts.join('\n')
+}
+
 /**
- * Register the `spawn_session` tool.
+ * Register the orchestration tools.
  * @param {import('@deepseek-ai/cordis').Context} ctx - calling context.
  * @param {Record<string, unknown>} [config] - optional plugin settings.
  */
 export function apply(ctx, config) {
   const settings = {
-    agentPreset: readSetting(config, 'agentPreset'),
-    permissionPreset: readSetting(config, 'permissionPreset'),
-    fallbackPermissionPreset: readSetting(config, 'fallbackPermissionPreset'),
+    agentPreset: readString(config, 'agentPreset'),
+    permissionPreset: readString(config, 'permissionPreset'),
+    fallbackPermissionPreset: readString(config, 'fallbackPermissionPreset'),
+    maxHops: readInteger(config, 'maxHops'),
+    answerTimeoutMs: readInteger(config, 'answerTimeoutMs'),
+    watchTtlMs: readInteger(config, 'watchTtlMs'),
   }
+
+  /** Hand-off depth of the chain each Session currently belongs to. */
+  const hops = new Map()
+  /** Messages this plugin injected, which must not reset a chain's depth. */
+  const injected = new Set()
+
+  // A genuine human message starts a new chain: only messages this plugin did
+  // not inject reset the depth, so a wake notice cannot restart the budget.
+  ctx.on('session/event', (session, event) => {
+    if (event.type !== 'user/message') return
+    const message = event.data?.message ?? event.data
+    if (message === undefined || message.source?.kind !== 'user') return
+    if (typeof message.id === 'string' && injected.has(message.id)) return
+    hops.set(session.id, 0)
+  })
 
   ctx.tools.register({
     name: 'spawn_session',
@@ -218,6 +286,166 @@ export function apply(ctx, config) {
       } finally {
         await releaseScope(scope)
       }
+    },
+  })
+
+  ctx.tools.register({
+    name: 'ask_session',
+    description:
+      'Send a message to a Session that is already live in this Host, for example one created by spawn_session '
+      + 'or one the user is watching in the sidebar. With wait:false (default) the call returns immediately and, '
+      + 'when that Session finishes its turn, this plugin delivers its answer back into the CALLING Session as a '
+      + 'new turn — that wake is how the caller resumes without polling. With wait:true the call blocks until the '
+      + 'target finishes (bounded by answerTimeoutMs) and returns the answer directly. '
+      + 'Only live sessions are addressable; a session that is not resident in this Host is rejected.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['sessionId', 'prompt'],
+      properties: {
+        sessionId: {
+          type: 'string',
+          description: 'Identity of the live target Session, as returned by spawn_session.',
+        },
+        prompt: {
+          type: 'string',
+          description: 'The message sent to the target Session.',
+        },
+        wait: {
+          type: 'boolean',
+          description: 'Block until the target finishes and return its answer, instead of returning at once and waking later.',
+        },
+        note: {
+          type: 'string',
+          description: 'Optional note echoed back in the waking message, e.g. what this hand-off is for.',
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sessionId', 'status'],
+        properties: {
+          sessionId: { type: 'string' },
+          status: {
+            type: 'string',
+            enum: ['answered', 'queued', 'timeout'],
+          },
+          reply: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.status === 'answered'
+          ? `Session ${value.sessionId} answered:\n${value.reply ?? ''}`
+          : value.status === 'queued'
+            ? `Queued for ${value.sessionId}; the caller is woken when that turn ends.`
+            : `Session ${value.sessionId} is still running after the wait budget; the caller is woken when that turn ends.`,
+      }],
+    },
+    async execute(args, exec) {
+      const caller = exec.agent
+      if (caller === undefined) throw new Error('ask_session requires an owning agent session')
+
+      if (typeof args.sessionId !== 'string' || args.sessionId.trim() === '') {
+        throw new TypeError('ask_session sessionId must be a non-empty string')
+      }
+      if (typeof args.prompt !== 'string' || args.prompt.trim() === '') {
+        throw new TypeError('ask_session prompt must be a non-empty string')
+      }
+
+      const target = ctx.agents.get(args.sessionId)
+      if (target === undefined) {
+        throw new Error(
+          `session "${args.sessionId}" is not live in this Host, so it cannot be messaged; `
+          + 'only sessions resident here (spawned, or open in the UI) are addressable',
+        )
+      }
+
+      const callerSession = caller.session
+      const callerId = callerSession.id
+      if (target.session.id === callerId) throw new Error('ask_session cannot target the calling session')
+
+      const depth = (hops.get(callerId) ?? 0) + 1
+      if (depth > settings.maxHops) {
+        throw new Error(`ask_session exceeded maxHops (${settings.maxHops}); a hand-off chain may not grow further`)
+      }
+
+      // Only a `turn/end` past this mark belongs to the turn this call starts.
+      const baseline = target.session.seq
+      let latest = ''
+      let settled = false
+      /** Whether the tool call already returned a result to the caller. */
+      let reported = false
+      let resolveAnswer
+      const answered = new Promise(resolve => { resolveAnswer = resolve })
+
+      const cleanup = () => {
+        if (settled) return
+        settled = true
+        off()
+        clearTimeout(ttlTimer)
+        clearTimeout(answerTimer)
+      }
+
+      const settle = (reason) => {
+        cleanup()
+        hops.set(callerId, depth)
+        if (reason === 'answered' && !reported) {
+          reported = true
+          resolveAnswer({ status: 'answered', reply: latest })
+          return
+        }
+        // Either the call already returned (queued, or the wait budget elapsed),
+        // or the watch itself expired: deliver what we have as a new turn so the
+        // caller is still woken instead of losing the answer.
+        const notice = userMessage(buildNotice({
+          sessionId: target.session.id,
+          title: undefined,
+          reply: latest,
+          note: typeof args.note === 'string' && args.note.trim() !== '' ? args.note : undefined,
+        }))
+        injected.add(notice.id)
+        caller.followup(notice)
+        reported = true
+        resolveAnswer({ status: reason === 'answered' ? 'answered' : 'timeout' })
+      }
+
+      const off = ctx.on('session/event', (session, event) => {
+        if (session.id !== target.session.id) return
+        if (event.seq <= baseline) return
+        if (event.type === 'assistant/message') {
+          const text = textOf(event.data?.message)
+          if (text !== '') latest = text
+          return
+        }
+        if (event.type === 'turn/end') settle('answered')
+      })
+
+      const ttlTimer = setTimeout(() => {
+        if (settled) return
+        settle('timeout')
+        ctx.logger?.warn?.(`spawn-session: hand-off to "${target.session.id}" expired before that turn ended`)
+      }, settings.watchTtlMs)
+      ttlTimer.unref?.()
+
+      const answerTimer = setTimeout(() => {
+        if (settled || reported) return
+        // The wait budget is a reporting limit, not a cancellation: keep
+        // listening so the caller is still woken when the turn really ends.
+        reported = true
+        resolveAnswer({ status: 'timeout' })
+      }, settings.answerTimeoutMs)
+      answerTimer.unref?.()
+
+      target.followup(userMessage(args.prompt))
+
+      if (args.wait !== true) {
+        reported = true
+        resolveAnswer({ status: 'queued' })
+      }
+      return answered
     },
   })
 }
