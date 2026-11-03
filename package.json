@@ -25,11 +25,11 @@
   "author": "He Binghui",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Binghui-H/dsh-dsh-spawn-session.git"
+    "url": "git+https://github.com/Binghui-H/dsh-spawn-session.git"
   },
-  "homepage": "https://github.com/Binghui-H/dsh-dsh-spawn-session#readme",
+  "homepage": "https://github.com/Binghui-H/dsh-spawn-session#readme",
   "bugs": {
-    "url": "https://github.com/Binghui-H/dsh-dsh-spawn-session/issues"
+    "url": "https://github.com/Binghui-H/dsh-spawn-session/issues"
   },
   "dsh": {
     "bundle": {

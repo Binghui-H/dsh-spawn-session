@@ -37,7 +37,7 @@ DSH 的侧边栏按「工作区分组」展示会话。用命令行 `dsh --profi
 ```powershell
 dsh plugin --profile desktop add dsh-spawn-session
 # 或从 GitHub 直装：
-dsh plugin --profile desktop add github:Binghui-H/dsh-dsh-spawn-session
+dsh plugin --profile desktop add github:Binghui-H/dsh-spawn-session
 ```
 
 ### 2. 登记到 bundles
