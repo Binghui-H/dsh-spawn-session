@@ -1,0 +1,39 @@
+{
+  "name": "dsh-spawn-session",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Spawn a Session into a chosen Workspace and prompt it, from a tool call.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "workspace",
+    "session"
+  ],
+  "license": "MIT",
+  "author": "He Binghui",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Binghui-H/dsh-dsh-spawn-session.git"
+  },
+  "homepage": "https://github.com/Binghui-H/dsh-dsh-spawn-session#readme",
+  "bugs": {
+    "url": "https://github.com/Binghui-H/dsh-dsh-spawn-session/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
